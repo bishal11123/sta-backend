@@ -2,10 +2,17 @@ import express from 'express';
 import mongoose from 'mongoose';
 import cors from 'cors';
 import studentRoutes from './routes/studentRoutes.js';
-import paymentRoutes from './routes/paymentRoutes.js';
-import customIncomeRoutes from './routes/customIncomeRoutes.js';
 import classRoutes from './routes/classRoutes.js';
-import attendanceRoutes from './routes/attendanceRoutes.js';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+// Required to use `__dirname` in ES module
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// Serve profile images and documents from /uploads
+
+
 
 
 
@@ -20,10 +27,9 @@ app.use(cors());
 app.use(express.json());
 
 app.use('/api/students', studentRoutes);
-app.use('/api/payments', paymentRoutes);
-app.use('/api/custom-incomes', customIncomeRoutes);
 app.use('/api/classes', classRoutes);
-app.use('/api/attendance', attendanceRoutes);
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+
 
 
 

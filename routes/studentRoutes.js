@@ -1,142 +1,270 @@
-import express from 'express';
-import Student from '../models/Student.js';
-import Payment from '../models/Payment.js';
-import Class from '../models/Class.js'; // 🔁 Import Class model
-
-
-
+import express from "express";
+import Student from "../models/Student.js";
+import Class from "../models/Class.js";
+import multer from "multer";
+import path from "path";
+import sharp from "sharp";
+import fs from "fs";
+import PDFDocument from "pdfkit";
 
 
 const router = express.Router();
 
-const validCOEStatus = ['Pending', 'Applied', 'Received'];
-const validVisaStatus = ['Pending', 'Applied', 'Granted', 'Rejected'];
-const validAdmissionStatus = ['Admitted', 'Pending'];
-const validCourseStatus = ['Not Started', 'In Progress', 'Completed'];
-const validInterviewStatus = ['Not Scheduled', 'Scheduled', 'Completed', 'Passed', 'Failed'];
+/* ===========================
+   CREATE REQUIRED FOLDERS
+=========================== */
+["uploads/profile-images", "uploads/documents"].forEach(dir => {
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+});
 
-function validateEnumFields(data) {
-  if (!validCOEStatus.includes(data.COEStatus)) {
-    data.COEStatus = 'Pending';
-  }
-  if (!validVisaStatus.includes(data.visaStatus)) {
-    data.visaStatus = 'Pending';
-  }
-  if (!validAdmissionStatus.includes(data.admissionStatus)) {
-    data.admissionStatus = 'Pending';
-  }
-  if (!validCourseStatus.includes(data.courseStatus)) {
-    data.courseStatus = 'Not Started';
-  }
-  if (!validInterviewStatus.includes(data.interviewStatus)) {
-    data.interviewStatus = 'Not Scheduled';
+/* ===========================
+   ENUM VALIDATION
+=========================== */
+const validCOEStatus = ["Pending", "Applied", "Received"];
+function validateCOEStatus(data) {
+  if (!validCOEStatus.includes(data.COEStatus)) data.COEStatus = "Pending";
+}
+
+/* ===========================
+   MULTER STORAGE
+=========================== */
+const profileStorage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, "uploads/profile-images"),
+  filename: (req, file, cb) => cb(null, `${req.params.id || Date.now()}${path.extname(file.originalname)}`),
+});
+const uploadProfile = multer({ storage: profileStorage });
+
+const docStorage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, "uploads/documents"),
+  filename: (req, file, cb) => cb(null, `${req.params.id || Date.now()}${path.extname(file.originalname)}`),
+});
+const uploadDoc = multer({ storage: docStorage });
+
+/* ===========================
+   HELPERS
+=========================== */
+function parseJSONField(field, fallback = []) {
+  try {
+    return field ? JSON.parse(field) : fallback;
+  } catch {
+    return fallback;
   }
 }
 
-router.get('/', async (req, res) => {
+function parseStudentData(body, file, existing = {}) {
+  return {
+    firstName: body.firstName ?? existing.firstName,
+    lastName: body.lastName ?? existing.lastName,
+    phone: body.phone ?? existing.phone,
+    sex: body.sex ?? existing.sex,
+    dob: body.dob ? new Date(body.dob) : existing.dob,
+    pob: body.pob ?? existing.pob,
+    email: body.email ?? existing.email,
+    currAdd: body.currAdd ?? existing.currAdd,
+    tempAdd: body.tempAdd ?? existing.tempAdd,
+    perAdd: body.perAdd ?? existing.perAdd,
+    passNum: body.passNum ?? existing.passNum,
+    passDoi: body.passDoi ? new Date(body.passDoi) : existing.passDoi,
+    passDoe: body.passDoe ? new Date(body.passDoe) : existing.passDoe,
+    COEStatus: body.COEStatus ?? existing.COEStatus,
+    remarks: body.remarks ?? existing.remarks,
+    classId: body.classId ?? existing.classId,
+    profileImage: file ? file.filename : existing.profileImage,
+    academicRecords: parseJSONField(body.academicRecords, existing.academicRecords),
+    familyMembers: parseJSONField(body.familyMembers, existing.familyMembers),
+    workExperiences: parseJSONField(body.workExperiences, existing.workExperiences),
+    documents: parseJSONField(body.documents, existing.documents),
+  };
+}
+
+/* ===========================
+   ROUTES
+=========================== */
+
+// GET all students
+router.get("/", async (req, res) => {
   try {
-    const students = await Student.find().populate('classId');
+    const students = await Student.find().populate("classId");
     res.json(students);
-  } catch (error) {
-    console.error('Error fetching students:', error);
-    res.status(500).json({ message: 'Server error' });
+  } catch (err) {
+    console.error("GET students error:", err);
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// GET summary
+router.get("/summary", async (req, res) => {
+  try {
+    const totalStudents = await Student.countDocuments();
+    const pendingCoe = await Student.countDocuments({ COEStatus: "Pending" });
+    const appliedCoe = await Student.countDocuments({ COEStatus: "Applied" });
+    const receivedCoe = await Student.countDocuments({ COEStatus: "Received" });
+
+    res.json({ totalStudents, pendingCoe, appliedCoe, receivedCoe });
+  } catch (err) {
+    console.error("Summary error:", err);
+    res.status(500).json({ message: err.message });
+  }
+});
+
+router.get("/search", async (req, res) => {
+  try {
+    const q = req.query.q?.trim();
+    if (!q) return res.json([{ id: null, name: "Not found" }]);
+
+    const results = await Student.find({
+      $or: [
+        { firstName: { $regex: q, $options: "i" } },
+        { lastName: { $regex: q, $options: "i" } },
+      ],
+    }).limit(10);
+
+    if (!results.length) return res.json([{ id: null, name: "Not found" }]);
+
+    res.json(results.map(s => ({ id: s._id, name: `${s.firstName} ${s.lastName}` })));
+  } catch (err) {
+    console.error("Search error:", err);
+    res.status(500).json([{ id: null, name: "Not found" }]);
   }
 });
 
 
-router.post('/', async (req, res) => {
+
+// GET single student
+router.get("/:id", async (req, res) => {
   try {
-    const data = req.body;
-    validateEnumFields(data);
+    const student = await Student.findById(req.params.id).populate("classId");
+    if (!student) return res.status(404).json({ message: "Student not found" });
+    res.json(student);
+  } catch (err) {
+    console.error("GET student by ID error:", err);
+    res.status(500).json({ message: err.message });
+  }
+});
 
-    // ✅ Handle Rs. 2000 income logic
-    data.income = data.eligibleForIncomeBonus ? 2000 : 0;
-
-    const student = new Student(data);
+// CREATE student
+router.post("/", uploadProfile.single("profileImage"), async (req, res) => {
+  try {
+    validateCOEStatus(req.body);
+    const studentData = parseStudentData(req.body, req.file);
+    const student = new Student(studentData);
     await student.save();
 
-    // ✅ Push student ID into the Class document
-    if (data.classId) {
-      await Class.findByIdAndUpdate(data.classId, {
-        $addToSet: { students: student._id }, // prevents duplicates
+    if (student.classId) {
+      await Class.findByIdAndUpdate(student.classId, { $addToSet: { students: student._id } });
+    }
+
+    res.status(201).json({ student });
+  } catch (err) {
+    console.error("Create student error:", err);
+    res.status(400).json({ message: err.message });
+  }
+});
+
+// DELETE student
+router.delete("/:id", async (req, res) => {
+  try {
+    const student = await Student.findByIdAndDelete(req.params.id);
+    if (!student) return res.status(404).json({ message: "Student not found" });
+
+    // Remove student reference from class (if any)
+    if (student.classId) {
+      await Class.findByIdAndUpdate(student.classId, {
+        $pull: { students: student._id },
       });
     }
 
-    res.status(201).json(student);
-  } catch (error) {
-    console.error('Error creating student:', error);
-    res.status(400).json({ message: error.message });
+    res.json({ message: "Student deleted successfully" });
+  } catch (err) {
+    console.error("Delete error:", err);
+    res.status(500).json({ message: err.message });
   }
 });
 
 
-router.put('/:id', async (req, res) => {
+// UPDATE student
+router.put("/:id", uploadProfile.single("profileImage"), async (req, res) => {
   try {
-    const data = req.body;
-    validateEnumFields(data);
+    validateCOEStatus(req.body);
+    const existing = await Student.findById(req.params.id);
+    if (!existing) return res.status(404).json({ message: "Student not found" });
 
-    const existingStudent = await Student.findById(req.params.id);
-    if (!existingStudent) {
-      return res.status(404).json({ message: 'Student not found' });
+    const updateData = parseStudentData(req.body, req.file, existing);
+
+    // Delete old profile image if replaced
+    if (req.file && existing.profileImage) {
+      const oldPath = path.resolve("uploads/profile-images", existing.profileImage);
+      if (fs.existsSync(oldPath)) await fs.promises.unlink(oldPath);
     }
 
-    let income = existingStudent.income ?? 2000;
-    let prevStage = existingStudent.coeBonusStage || 'None';
-    let newStage = prevStage;
-    const newStatus = data.COEStatus;
+    const updated = await Student.findByIdAndUpdate(req.params.id, updateData, { new: true });
+    res.json({ student: updated });
+  } catch (err) {
+    console.error("Update student error:", err);
+    res.status(400).json({ message: err.message });
+  }
+});
 
-    // COE bonus logic (unchanged)
-    if (prevStage === 'None') {
-      if (newStatus === 'Applied') {
-        income += 5000;
-        newStage = 'Applied';
-      } else if (newStatus === 'Received') {
-        income += 15000;
-        newStage = 'Received';
-      }
-    } else if (prevStage === 'Applied') {
-      if (newStatus === 'Pending') {
-        income -= 5000;
-        newStage = 'None';
-      } else if (newStatus === 'Received') {
-        income += 10000;
-        newStage = 'Received';
-      }
-    } else if (prevStage === 'Received') {
-      if (newStatus === 'Applied') {
-        income -= 10000;
-        newStage = 'Applied';
-      } else if (newStatus === 'Pending') {
-        income -= 15000;
-        newStage = 'None';
+// UPLOAD profile image
+// UPLOAD profile image separately
+router.put("/:id/profile-image", uploadProfile.single("profileImage"), async (req, res) => {
+  if (!req.file) return res.status(400).json({ message: "No image uploaded" });
+
+  try {
+    const student = await Student.findById(req.params.id);
+    if (!student) return res.status(404).json({ message: "Student not found" });
+
+    // Delete old image if exists
+    if (student.profileImage) {
+      const oldPath = path.join("uploads/profile-images", student.profileImage);
+      if (fs.existsSync(oldPath)) {
+        await fs.promises.unlink(oldPath);
       }
     }
 
-    data.income = income;
-    data.coeBonusStage = newStage;
+    // Resize new image
+    const ext = path.extname(req.file.originalname);
+    const resizedName = `${req.file.filename}-resized${ext}`;
+    const resizedPath = path.join("uploads/profile-images", resizedName);
 
-    // ==== NEW CLASS SYNC LOGIC ====
-    const oldClassId = existingStudent.classId ? existingStudent.classId.toString() : null;
-    const newClassId = data.classId;
+    await sharp(req.file.path).resize(300, 300).toFile(resizedPath);
+    await fs.promises.unlink(req.file.path);
 
-    // Update student first (excluding syncing class for now)
-    const updatedStudent = await Student.findByIdAndUpdate(req.params.id, data, { new: true });
+    // Update profileImage and save without validating other fields
+    student.profileImage = resizedName;
+    await student.save({ validateBeforeSave: false }); // <- skip validation
 
-    if (oldClassId !== newClassId) {
-      if (oldClassId) {
-        // Remove student ID from old class's students array
-        await Class.findByIdAndUpdate(oldClassId, { $pull: { students: updatedStudent._id } });
-      }
-      if (newClassId) {
-        // Add student ID to new class's students array
-        await Class.findByIdAndUpdate(newClassId, { $addToSet: { students: updatedStudent._id } });
-      }
-    }
+    res.json({ student });
+  } catch (err) {
+    console.error("Error uploading profile image:", err);
+    res.status(500).json({ message: err.message });
+  }
+});
 
-    res.json(updatedStudent);
-  } catch (error) {
-    console.error('Error updating student:', error);
-    res.status(400).json({ message: error.message });
+
+// UPLOAD multiple documents
+router.post("/:id/documents", uploadDoc.array("documents"), async (req, res) => {
+  if (!req.files || req.files.length === 0)
+    return res.status(400).json({ message: "No documents uploaded" });
+
+  try {
+    const student = await Student.findById(req.params.id);
+    if (!student) return res.status(404).json({ message: "Student not found" });
+
+    req.files.forEach(file => {
+      student.documents.push({
+        fileName: file.filename,
+        filePath: `/uploads/documents/${file.filename}`,
+      });
+    });
+
+    // Skip validation to prevent unrelated errors
+    await student.save({ validateBeforeSave: false });
+
+    res.status(201).json({ student });
+  } catch (err) {
+    console.error("Error uploading documents:", err);
+    res.status(500).json({ message: err.message });
   }
 });
 
@@ -144,107 +272,106 @@ router.put('/:id', async (req, res) => {
 
 
 
+router.get("/:id/profile", async (req, res) => {
+  try {
+    const student = await Student.findById(req.params.id).lean(); // plain JS object
+    if (!student) return res.status(404).send("Student not found");
 
+    const doc = new PDFDocument({ margin: 50, size: "A4" });
 
-router.delete('/:id', async (req, res) => {
-  await Student.findByIdAndDelete(req.params.id);
-  res.status(204).end();
-});
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename=profile_${student.firstName}_${student.lastName}.pdf`
+    );
 
-// Single /summary route with income calculation
-router.get('/summary', async (req, res) => {
-  const { month, year, newStudentIncome, coeAppliedIncome, coeReceivedIncome } = req.query;
+    doc.pipe(res);
 
-  const start = new Date(`${year}-${month}-01`);
-  const end = new Date(`${year}-${month}-31`);
+    // Header
+    doc.fontSize(18).text("Student Profile", { align: "center" }).moveDown(1);
 
-  const newIncome = Number(newStudentIncome) || 2000;
-  const appliedIncome = Number(coeAppliedIncome) || 5000;
-  const receivedIncome = Number(coeReceivedIncome) || 10000;
-
-  const students = await Student.find({
-    consultancyAdmissionDate: { $gte: start, $lte: end },
-  });
-
-  // Payments received from students
-  const paymentsReceivedFromStudents = students
-    .filter(s => s.paymentReceivedDate && s.paymentReceivedDate >= start && s.paymentReceivedDate <= end)
-    .reduce((sum, s) => sum + (s.paymentReceived || 0), 0);
-
-  // External payments
-  const externalPayments = await Payment.find({
-    date: { $gte: start, $lte: end }
-  });
-
-  const paymentsReceivedFromExternal = externalPayments.reduce((sum, p) => sum + p.amount, 0);
-  const totalPaymentsReceived = paymentsReceivedFromStudents + paymentsReceivedFromExternal;
-
-  // 🟡 Dynamic income calculation
-  const totalIncome = students.reduce((sum, s) => {
-    let income = s.eligibleForIncomeBonus ? newIncome : 0;
-
-    if (s.COEStatus === 'Applied' || s.COEStatus === 'Received') {
-      income += appliedIncome;
+    // Profile Image
+    if (student.profileImage) {
+      const imagePath = path.join("uploads/profile-images", student.profileImage);
+      if (fs.existsSync(imagePath)) {
+        doc.image(imagePath, doc.page.width / 2 - 50, doc.y, { width: 100, height: 100 });
+        doc.moveDown(6);
+      }
     }
 
-    if (s.COEStatus === 'Received') {
-      income += receivedIncome;
+    // Personal Info
+    const info = [
+      ["Full Name", `${student.firstName} ${student.lastName}`],
+      ["Email", student.email || "N/A"],
+      ["Phone", student.phone || "N/A"],
+      ["Sex", student.sex],
+      ["DOB", student.dob ? new Date(student.dob).toDateString() : "N/A"],
+      ["POB", student.pob || "N/A"],
+      ["Current Address", student.currAdd || "N/A"],
+    ];
+    info.forEach(([label, value]) => {
+      doc.fontSize(12).text(`${label}: ${value}`);
+    });
+    doc.moveDown(1);
+
+    // Family Members Table
+    if (student.familyMembers.length) {
+      doc.fontSize(14).text("Family Members", { underline: true }).moveDown(0.5);
+      drawTable(doc, ["Name", "Relation", "Contact", "DOB", "Occupation"], student.familyMembers.map(m => [
+        m.name, m.relationship, m.contact, m.dob ? new Date(m.dob).toDateString() : "", m.occupation
+      ]));
+      doc.moveDown(1);
     }
 
-    return sum + income;
-  }, 0);
+    // Academic Records Table
+    if (student.academicRecords.length) {
+      doc.fontSize(14).text("Academic Records", { underline: true }).moveDown(0.5);
+      drawTable(doc, ["Type", "School", "Faculty", "From", "To"], student.academicRecords.map(a => [
+        a.type, a.schoolName, a.faculty || "", a.from ? new Date(a.from).getFullYear() : "", a.to ? new Date(a.to).getFullYear() : ""
+      ]));
+      doc.moveDown(1);
+    }
 
-  const paymentDue = totalIncome - totalPaymentsReceived;
-  const pendingCOEs = students.filter(s => s.COEStatus === 'Pending').length;
+    // Remarks
+    if (student.remarks) {
+      doc.fontSize(14).text("Remarks", { underline: true }).moveDown(0.5);
+      doc.fontSize(12).text(student.remarks);
+    }
 
-  res.json({
-    totalStudents: students.length,
-    paymentsReceivedFromStudents,
-    paymentsReceivedFromExternal,
-    totalPaymentsReceived,
-    paymentDue,
-    pendingCOEs,
-    totalIncome,
-  });
+    doc.end();
+  } catch (err) {
+    console.error(err);
+    res.status(500).send("Error generating PDF");
+  }
 });
 
-router.get('/calculation', async (req, res) => {
-  const { from, to, newStudentIncome, coeAppliedIncome, coeReceivedIncome } = req.query;
-  const fromDate = new Date(from);
-  const toDate = new Date(to);
+// Simple table helper
+function drawTable(doc, headers, rows, startY) {
+  const columnWidth = doc.page.width / headers.length - 10;
+  let y = startY || doc.y;
 
-  const newIncome = Number(newStudentIncome) || 2000;
-  const appliedIncome = Number(coeAppliedIncome) || 5000;
-  const receivedIncome = Number(coeReceivedIncome) || 10000;
+  // Header
+  headers.forEach((h, i) => {
+    doc.font("Helvetica-Bold").text(h, 50 + i * columnWidth, y, { width: columnWidth });
+  });
+  y += 20;
 
-  const students = await Student.find({
-    consultancyAdmissionDate: { $gte: fromDate, $lte: toDate }
+  // Rows
+  rows.forEach(row => {
+    row.forEach((cell, i) => {
+      doc.font("Helvetica").text(cell || "", 50 + i * columnWidth, y, { width: columnWidth });
+    });
+    y += 20;
   });
 
-  const totalIncome = students.reduce((sum, s) => sum + (s.income || 0), 0);
-
-  const newStudentIncomeSum = students.reduce((sum, s) => {
-    return sum + (s.eligibleForIncomeBonus ? newIncome : 0);
-  }, 0);
-
-  const coeAppliedIncomeSum = students.filter(
-    s => s.COEStatus === 'Applied' || s.COEStatus === 'Received'
-  ).length * appliedIncome;
-
-  const coeReceivedIncomeSum = students.filter(s => s.COEStatus === 'Received').length * receivedIncome;
-
-  res.json({
-    newStudentIncome: newStudentIncomeSum,
-    coeAppliedIncome: coeAppliedIncomeSum,
-    coeReceivedIncome: coeReceivedIncomeSum,
-    totalIncome,
-    students,
-  });
-});
+  return y;
+}
 
 
 
 
-
+// Serve uploads
+router.use("/uploads/profile-images", express.static(path.join("uploads/profile-images")));
+router.use("/uploads/documents", express.static(path.join("uploads/documents")));
 
 export default router;
